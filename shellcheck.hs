@@ -34,6 +34,8 @@ import qualified ShellCheck.Formatter.Quiet
 
 import           Control.Exception
 import           Control.Monad
+import           Control.Monad.IO.Class
+import           Control.Monad.Trans.Class
 import           Control.Monad.Except
 import           Data.Bits
 import           Data.Char
@@ -74,7 +76,8 @@ data Options = Options {
     externalSources  :: Bool,
     sourcePaths      :: [FilePath],
     formatterOptions :: FormatterOptions,
-    minSeverity      :: Severity
+    minSeverity      :: Severity,
+    rcfile           :: Maybe FilePath
 }
 
 defaultOptions = Options {
@@ -84,7 +87,8 @@ defaultOptions = Options {
     formatterOptions = newFormatterOptions {
         foColorOption = ColorAuto
     },
-    minSeverity = StyleC
+    minSeverity = StyleC,
+    rcfile = Nothing
 }
 
 usageHeader = "Usage: shellcheck [OPTIONS...] FILES..."
@@ -98,6 +102,8 @@ options = [
         (ReqArg (Flag "include") "CODE1,CODE2..") "Consider only given types of warnings",
     Option "e" ["exclude"]
         (ReqArg (Flag "exclude") "CODE1,CODE2..") "Exclude types of warnings",
+    Option "" ["extended-analysis"]
+        (ReqArg (Flag "extended-analysis") "bool") "Perform dataflow analysis (default true)",
     Option "f" ["format"]
         (ReqArg (Flag "format") "FORMAT") $
         "Output format (" ++ formatList ++ ")",
@@ -105,6 +111,9 @@ options = [
         (NoArg $ Flag "list-optional" "true") "List checks disabled by default",
     Option "" ["norc"]
         (NoArg $ Flag "norc" "true") "Don't look for .shellcheckrc files",
+    Option "" ["rcfile"]
+        (ReqArg (Flag "rcfile") "RCFILE")
+        "Prefer the specified configuration file over searching for one",
     Option "o" ["enable"]
         (ReqArg (Flag "enable") "check1,check2..")
         "List of optional checks to enable (or 'all')",
@@ -113,7 +122,7 @@ options = [
         "Specify path when looking for sourced files (\"SCRIPTDIR\" for script's dir)",
     Option "s" ["shell"]
         (ReqArg (Flag "shell") "SHELLNAME")
-        "Specify dialect (sh, bash, dash, ksh)",
+        "Specify dialect (sh, bash, dash, ksh, busybox)",
     Option "S" ["severity"]
         (ReqArg (Flag "severity") "SEVERITY")
         "Minimum severity of errors to consider (error, warning, info, style)",
@@ -225,7 +234,7 @@ runFormatter sys format options files = do
     f :: Status -> FilePath -> IO Status
     f status file = do
         newStatus <- process file `catch` handler file
-        return $ status `mappend` newStatus
+        return $! status `mappend` newStatus
     handler :: FilePath -> IOException -> IO Status
     handler file e = reportFailure file (show e)
     reportFailure file str = do
@@ -250,9 +259,9 @@ runFormatter sys format options files = do
                 else SomeProblems
 
 parseEnum name value list =
-    case filter ((== value) . fst) list of
-        [(name, value)] -> return value
-        [] -> do
+    case lookup value list of
+        Just value -> return value
+        Nothing -> do
             printErr $ "Unknown value for --" ++ name ++ ". " ++
                        "Valid options are: " ++ (intercalate ", " $ map fst list)
             throwError SupportFailure
@@ -365,10 +374,23 @@ parseOption flag options =
                 }
             }
 
+        Flag "rcfile" str -> do
+            return options {
+                rcfile = Just str
+            }
+
         Flag "enable" value ->
             let cs = checkSpec options in return options {
                 checkSpec = cs {
                     csOptionalChecks = (csOptionalChecks cs) ++ split ',' value
+                }
+            }
+
+        Flag "extended-analysis" str -> do
+            value <- parseBool str
+            return options {
+                checkSpec = (checkSpec options) {
+                    csExtendedAnalysis = Just value
                 }
             }
 
@@ -389,12 +411,20 @@ parseOption flag options =
             throwError SyntaxFailure
         return (Prelude.read num :: Integer)
 
+    parseBool str = do
+        case str of
+            "true" -> return True
+            "false" -> return False
+            _ -> do
+                printErr $ "Invalid boolean, expected true/false: " ++ str
+                throwError SyntaxFailure
+
 ioInterface :: Options -> [FilePath] -> IO (SystemInterface IO)
 ioInterface options files = do
     inputs <- mapM normalize files
     cache <- newIORef emptyCache
     configCache <- newIORef ("", Nothing)
-    return SystemInterface {
+    return (newSystemInterface :: SystemInterface IO) {
         siReadFile = get cache inputs,
         siFindSource = findSourceFile inputs (sourcePaths options),
         siGetConfig = getConfig configCache
@@ -439,18 +469,33 @@ ioInterface options files = do
         fallback :: FilePath -> IOException -> IO FilePath
         fallback path _ = return path
 
+
     -- Returns the name and contents of .shellcheckrc for the given file
-    getConfig cache filename = do
-        path <- normalize filename
-        let dir = takeDirectory path
-        (previousPath, result) <- readIORef cache
-        if dir == previousPath
-          then return result
-          else do
-            paths <- getConfigPaths dir
-            result <- findConfig paths
-            writeIORef cache (dir, result)
-            return result
+    getConfig cache filename =
+        case rcfile options of
+            Just file -> do
+                -- We have a specified rcfile. Ignore normal rcfile resolution.
+                (path, result) <- readIORef cache
+                if path == "/"
+                  then return result
+                  else do
+                    result <- readConfig file
+                    when (isNothing result) $
+                        hPutStrLn stderr $ "Warning: unable to read --rcfile " ++ file
+                    writeIORef cache ("/", result)
+                    return result
+
+            Nothing -> do
+                path <- normalize filename
+                let dir = takeDirectory path
+                (previousPath, result) <- readIORef cache
+                if dir == previousPath
+                  then return result
+                  else do
+                    paths <- getConfigPaths dir
+                    result <- findConfig paths
+                    writeIORef cache (dir, result)
+                    return result
 
     findConfig paths =
         case paths of
@@ -488,7 +533,7 @@ ioInterface options files = do
       where
         handler :: FilePath -> IOException -> IO (String, Bool)
         handler file err = do
-            putStrLn $ file ++ ": " ++ show err
+            hPutStrLn stderr $ file ++ ": " ++ show err
             return ("", True)
 
     andM a b arg = do

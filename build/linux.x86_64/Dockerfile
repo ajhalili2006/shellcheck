@@ -1,16 +1,14 @@
-FROM ubuntu:20.04
+FROM alpine:3.16
+# alpine:3.16 (GHC 9.0.1):  5.8 megabytes
+# alpine:3.17 (GHC 9.0.2): 15.0 megabytes
+# alpine:3.18 (GHC 9.4.4): 29.0 megabytes
+# alpine:3.19 (GHC 9.4.7): 29.0 megabytes
 
 ENV TARGETNAME linux.x86_64
 
 # Install GHC and cabal
 USER root
-ENV DEBIAN_FRONTEND noninteractive
-RUN apt-get update && apt-get install -y ghc curl xz-utils
-
-# So we'd like a later version of Cabal that supports --enable-executable-static,
-# but we can't use Ubuntu 20.10 because coreutils has switched to new syscalls that
-# the TravisCI kernel doesn't support. Download it manually.
-RUN curl "https://downloads.haskell.org/~cabal/cabal-install-3.2.0.0/cabal-install-3.2.0.0-x86_64-unknown-linux.tar.xz" | tar xJv -C /usr/bin
+RUN apk add ghc cabal g++ libffi-dev curl bash
 
 # Use ld.bfd instead of ld.gold due to
 # x86_64-linux-gnu/libpthread.a(pthread_cond_init.o)(.note.stapsdt+0x14): error:

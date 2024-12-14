@@ -77,7 +77,7 @@ You can see ShellCheck suggestions directly in a variety of editors.
 
 * Sublime, through [SublimeLinter](https://github.com/SublimeLinter/SublimeLinter-shellcheck).
 
-* Atom, through [Linter](https://github.com/AtomLinter/linter-shellcheck).
+* Pulsar Edit (former Atom), through [linter-shellcheck-pulsar](https://github.com/pulsar-cooperative/linter-shellcheck-pulsar).
 
 * VSCode, through [vscode-shellcheck](https://github.com/timonwong/vscode-shellcheck).
 
@@ -110,8 +110,11 @@ Services and platforms that have ShellCheck pre-installed and ready to use:
 * [Codacy](https://www.codacy.com/)
 * [Code Climate](https://codeclimate.com/)
 * [Code Factor](https://www.codefactor.io/)
+* [Codety](https://www.codety.io/) via the [Codety Scanner](https://github.com/codetyio/codety-scanner)
 * [CircleCI](https://circleci.com) via the [ShellCheck Orb](https://circleci.com/orbs/registry/orb/circleci/shellcheck)
 * [Github](https://github.com/features/actions) (only Linux)
+* [Trunk Check](https://trunk.io/products/check) (universal linter; [allows you to explicitly version your shellcheck install](https://github.com/trunk-io/plugins/blob/bcbb361dcdbe4619af51ea7db474d7fb87540d20/.trunk/trunk.yaml#L32)) via the [shellcheck plugin](https://github.com/trunk-io/plugins/blob/main/linters/shellcheck/plugin.yaml)
+* [CodeRabbit](https://coderabbit.ai/)
 
 Most other services, including [GitLab](https://about.gitlab.com/), let you install
 ShellCheck yourself, either through the system's package manager (see [Installing](#installing)),
@@ -193,6 +196,12 @@ On Windows (via [chocolatey](https://chocolatey.org/packages/shellcheck)):
 C:\> choco install shellcheck
 ```
 
+Or Windows (via [winget](https://github.com/microsoft/winget-pkgs)):
+
+```cmd
+C:\> winget install --id koalaman.shellcheck
+```
+
 Or Windows (via [scoop](http://scoop.sh)):
 
 ```cmd
@@ -221,16 +230,25 @@ Using the [nix package manager](https://nixos.org/nix):
 nix-env -iA nixpkgs.shellcheck
 ```
 
+Using the [Flox package manager](https://flox.dev/)
+```sh
+flox install shellcheck
+```
+
 Alternatively, you can download pre-compiled binaries for the latest release here:
 
 * [Linux, x86_64](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz) (statically linked)
 * [Linux, armv6hf](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.armv6hf.tar.xz), i.e. Raspberry Pi (statically linked)
 * [Linux, aarch64](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.aarch64.tar.xz) aka ARM64 (statically linked)
+* [macOS, aarch64](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.darwin.aarch64.tar.xz)
 * [macOS, x86_64](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.darwin.x86_64.tar.xz)
 * [Windows, x86](https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.zip)
 
 or see the [GitHub Releases](https://github.com/koalaman/shellcheck/releases) for other releases
 (including the [latest](https://github.com/koalaman/shellcheck/releases/tag/latest) meta-release for daily git builds).
+
+There are currently no official binaries for Apple Silicon, but third party builds are available via
+[ShellCheck for Visual Studio Code](https://github.com/vscode-shellcheck/shellcheck-binaries/releases).
 
 Distro packages already come with a `man` page. If you are building from source, it can be installed with:
 
@@ -298,10 +316,6 @@ Verify that `cabal` is installed and update its dependency list with
 `git clone` this repository, and `cd` to the ShellCheck source directory to build/install:
 
     $ cabal install
-
-Or if you intend to run the tests:
-
-    $ cabal install --enable-tests
 
 This will compile ShellCheck and install it to your `~/.cabal/bin` directory.
 
@@ -548,4 +562,3 @@ Happy ShellChecking!
 
 * The wiki has [long form descriptions](https://github.com/koalaman/shellcheck/wiki/Checks) for each warning, e.g. [SC2221](https://github.com/koalaman/shellcheck/wiki/SC2221).
 * ShellCheck does not attempt to enforce any kind of formatting or indenting style, so also check out [shfmt](https://github.com/mvdan/sh)!
-

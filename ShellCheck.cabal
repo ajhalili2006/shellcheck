@@ -1,5 +1,5 @@
 Name:             ShellCheck
-Version:          0.7.2
+Version:          0.10.0
 Synopsis:         Shell script analysis tool
 License:          GPL-3
 License-file:     LICENSE
@@ -45,19 +45,26 @@ library
       build-depends:
         semigroups
     build-depends:
-      aeson,
-      array,
-      base >= 4.8.0.0 && < 5,
-      bytestring,
-      containers >= 0.5,
-      deepseq >= 1.4.0.0,
-      Diff >= 0.2.0,
-      directory >= 1.2.3.0,
-      mtl >= 2.2.1,
-      filepath,
-      parsec,
-      regex-tdfa,
-      QuickCheck >= 2.7.4,
+      -- The lower bounds are based on GHC 7.10.3
+      -- The upper bounds are based on GHC 9.8.1
+      aeson                >= 1.4.0 && < 2.3,
+      array                >= 0.5.1 && < 0.6,
+      base                 >= 4.8.0.0 && < 5,
+      bytestring           >= 0.10.6 && < 0.13,
+      containers           >= 0.5.6 && < 0.8,
+      deepseq              >= 1.4.1 && < 1.6,
+      Diff                 >= 0.4.0 && < 1.1,
+      fgl                  (>= 5.7.0 && < 5.8.1.0) || (>= 5.8.1.1 && < 5.9),
+      filepath             >= 1.4.0 && < 1.6,
+      mtl                  >= 2.2.2 && < 2.4,
+      parsec               >= 3.1.14 && < 3.2,
+      QuickCheck           >= 2.14.2 && < 2.16,
+      regex-tdfa           >= 1.2.0 && < 1.4,
+      transformers         >= 0.4.2 && < 0.7,
+
+      -- getXdgDirectory from 1.2.3.0
+      directory            >= 1.2.3 && < 1.4,
+
       -- When cabal supports it, move this to setup-depends:
       process
     exposed-modules:
@@ -66,11 +73,15 @@ library
       ShellCheck.Analytics
       ShellCheck.Analyzer
       ShellCheck.AnalyzerLib
+      ShellCheck.CFG
+      ShellCheck.CFGAnalysis
       ShellCheck.Checker
       ShellCheck.Checks.Commands
+      ShellCheck.Checks.ControlFlow
       ShellCheck.Checks.Custom
       ShellCheck.Checks.ShellSupport
       ShellCheck.Data
+      ShellCheck.Debug
       ShellCheck.Fixer
       ShellCheck.Formatter.Format
       ShellCheck.Formatter.CheckStyle
@@ -82,6 +93,7 @@ library
       ShellCheck.Formatter.Quiet
       ShellCheck.Interface
       ShellCheck.Parser
+      ShellCheck.Prelude
       ShellCheck.Regex
     other-modules:
       Paths_ShellCheck
@@ -94,17 +106,19 @@ executable shellcheck
     build-depends:
       aeson,
       array,
-      base >= 4 && < 5,
+      base,
       bytestring,
       containers,
-      deepseq >= 1.4.0.0,
-      Diff >= 0.2.0,
-      directory >= 1.2.3.0,
-      mtl >= 2.2.1,
+      deepseq,
+      Diff,
+      directory,
+      fgl,
+      mtl,
       filepath,
-      parsec >= 3.0,
-      QuickCheck >= 2.7.4,
+      parsec,
+      QuickCheck,
       regex-tdfa,
+      transformers,
       ShellCheck
     default-language: Haskell98
     main-is: shellcheck.hs
@@ -114,17 +128,19 @@ test-suite test-shellcheck
     build-depends:
       aeson,
       array,
-      base >= 4 && < 5,
+      base,
       bytestring,
       containers,
-      deepseq >= 1.4.0.0,
-      Diff >= 0.2.0,
-      directory >= 1.2.3.0,
-      mtl >= 2.2.1,
+      deepseq,
+      Diff,
+      directory,
+      fgl,
       filepath,
+      mtl,
       parsec,
-      QuickCheck >= 2.7.4,
+      QuickCheck,
       regex-tdfa,
+      transformers,
       ShellCheck
     default-language: Haskell98
     main-is: test/shellcheck.hs

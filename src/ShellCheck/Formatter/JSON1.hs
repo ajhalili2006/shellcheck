@@ -23,12 +23,13 @@ module ShellCheck.Formatter.JSON1 (format) where
 import ShellCheck.Interface
 import ShellCheck.Formatter.Format
 
+import Control.DeepSeq
 import Data.Aeson
 import Data.IORef
 import Data.Monoid
-import GHC.Exts
 import System.IO
 import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.List.NonEmpty as NE
 
 format :: IO Formatter
 format = do
@@ -113,14 +114,14 @@ outputError file msg = hPutStrLn stderr $ file ++ ": " ++ msg
 collectResult ref cr sys = mapM_ f groups
   where
     comments = crComments cr
-    groups = groupWith sourceFile comments
-    f :: [PositionedComment] -> IO ()
+    groups = NE.groupWith sourceFile comments
+    f :: NE.NonEmpty PositionedComment -> IO ()
     f group = do
-        let filename = sourceFile (head group)
+        let filename = sourceFile (NE.head group)
         result <- siReadFile sys (Just True) filename
         let contents = either (const "") id result
         let comments' = makeNonVirtual comments contents
-        modifyIORef ref (\x -> comments' ++ x)
+        deepseq comments' $ modifyIORef ref (\x -> comments' ++ x)
 
 finish ref = do
     list <- readIORef ref

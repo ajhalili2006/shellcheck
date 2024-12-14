@@ -23,6 +23,7 @@ import ShellCheck.Fixer
 import ShellCheck.Interface
 import ShellCheck.Formatter.Format
 
+import Control.DeepSeq
 import Control.Monad
 import Data.Array
 import Data.Foldable
@@ -30,9 +31,9 @@ import Data.Ord
 import Data.IORef
 import Data.List
 import Data.Maybe
-import GHC.Exts
 import System.IO
 import System.Info
+import qualified Data.List.NonEmpty as NE
 
 wikiLink = "https://www.shellcheck.net/wiki/"
 
@@ -88,7 +89,7 @@ rankError err = (ranking, cSeverity $ pcComment err, cCode $ pcComment err)
 appendComments errRef comments max = do
     previous <- readIORef errRef
     let current = map (\x -> (rankError x, cCode $ pcComment x, cMessage $ pcComment x)) comments
-    writeIORef errRef . take max . nubBy equal . sort $ previous ++ current
+    writeIORef errRef $! force . take max . nubBy equal . sort $ previous ++ current
   where
     fst3 (x,_,_) = x
     equal x y = fst3 x == fst3 y
@@ -116,19 +117,19 @@ outputResult options ref result sys = do
     color <- getColorFunc $ foColorOption options
     let comments = crComments result
     appendComments ref comments (fromIntegral $ foWikiLinkCount options)
-    let fileGroups = groupWith sourceFile comments
+    let fileGroups = NE.groupWith sourceFile comments
     mapM_ (outputForFile color sys) fileGroups
 
 outputForFile color sys comments = do
-    let fileName = sourceFile (head comments)
+    let fileName = sourceFile (NE.head comments)
     result <- siReadFile sys (Just True) fileName
     let contents = either (const "") id result
     let fileLinesList = lines contents
     let lineCount = length fileLinesList
     let fileLines = listArray (1, lineCount) fileLinesList
-    let groups = groupWith lineNo comments
+    let groups = NE.groupWith lineNo comments
     forM_ groups $ \commentsForLine -> do
-        let lineNum = fromIntegral $ lineNo (head commentsForLine)
+        let lineNum = fromIntegral $ lineNo (NE.head commentsForLine)
         let line = if lineNum < 1 || lineNum > lineCount
                         then ""
                         else fileLines ! fromIntegral lineNum
@@ -138,7 +139,7 @@ outputForFile color sys comments = do
         putStrLn (color "source" line)
         forM_ commentsForLine $ \c -> putStrLn $ color (severityText c) $ cuteIndent c
         putStrLn ""
-        showFixedString color commentsForLine (fromIntegral lineNum) fileLines
+        showFixedString color (toList commentsForLine) (fromIntegral lineNum) fileLines
 
 -- Pick out only the lines necessary to show a fix in action
 sliceFile :: Fix -> Array Int String -> (Fix, Array Int String)
@@ -168,7 +169,7 @@ showFixedString color comments lineNum fileLines =
             -- and/or other unrelated lines.
             let (excerptFix, excerpt) = sliceFile mergedFix fileLines
             -- in the spirit of error prone
-            putStrLn $ color "message" "Did you mean: "
+            putStrLn $ color "message" "Did you mean:"
             putStrLn $ unlines $ applyFix excerptFix excerpt
 
 cuteIndent :: PositionedComment -> String

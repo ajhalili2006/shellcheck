@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2019 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -20,10 +20,12 @@
 {-# LANGUAGE TemplateHaskell #-}
 module ShellCheck.Checker (checkScript, ShellCheck.Checker.runTests) where
 
+import ShellCheck.Analyzer
+import ShellCheck.ASTLib
 import ShellCheck.Interface
 import ShellCheck.Parser
-import ShellCheck.Analyzer
 
+import Debug.Trace -- DO NOT SUBMIT
 import Data.Either
 import Data.Functor
 import Data.List
@@ -85,7 +87,8 @@ checkScript sys spec = do
                     asCheckSourced = csCheckSourced spec,
                     asExecutionMode = Executed,
                     asTokenPositions = tokenPositions,
-                    asOptionalChecks = csOptionalChecks spec
+                    asExtendedAnalysis = csExtendedAnalysis spec,
+                    asOptionalChecks = getEnableDirectives root ++ csOptionalChecks spec
                 } where as = newAnalysisSpec root
         let analysisMessages =
                 maybe []
@@ -242,6 +245,9 @@ prop_canStripPrefixAndSource2 =
 
 prop_canSourceDynamicWhenRedirected =
     null $ checkWithIncludes [("lib", "")] "#shellcheck source=lib\n. \"$1\""
+
+prop_canRedirectWithSpaces =
+    null $ checkWithIncludes [("my file", "")] "#shellcheck source=\"my file\"\n. \"$1\""
 
 prop_recursiveAnalysis =
     [2086] == checkRecursive [("lib", "echo $1")] "source lib"
@@ -412,6 +418,15 @@ prop_sourcePathAddsAnnotation = result == [2086]
         csCheckSourced = True
     }
 
+prop_sourcePathWorksWithSpaces = result == [2086]
+  where
+    f "dir/myscript" _ ["my path"] "lib" = return "foo/lib"
+    result = checkWithIncludesAndSourcePath [("foo/lib", "echo $1")] f emptyCheckSpec {
+        csScript = "#!/bin/bash\n# shellcheck source-path='my path'\nsource lib",
+        csFilename = "dir/myscript",
+        csCheckSourced = True
+    }
+
 prop_sourcePathRedirectsDirective = result == [2086]
   where
     f "dir/myscript" _ _ "lib" = return "foo/lib"
@@ -483,6 +498,67 @@ prop_fileCannotEnableExternalSources2 = result == [1144]
         csCheckSourced = True
     }
 
+prop_rcCanSuppressEarlyProblems1 = null result
+  where
+    result = checkWithRc "disable=1071" emptyCheckSpec {
+        csScript = "#!/bin/zsh\necho $1"
+    }
+
+prop_rcCanSuppressEarlyProblems2 = null result
+  where
+    result = checkWithRc "disable=1104" emptyCheckSpec {
+        csScript = "!/bin/bash\necho 'hello world'"
+    }
+
+prop_sourceWithHereDocWorks = null result
+  where
+    result = checkWithIncludes [("bar", "true\n")] "source bar << eof\nlol\neof"
+
+prop_hereDocsAreParsedWithoutTrailingLinefeed = 1044 `elem` result
+  where
+    result = check "cat << eof"
+
+prop_hereDocsWillHaveParsedIndices = null result
+  where
+    result = check "#!/bin/bash\nmy_array=(a b)\ncat <<EOF >> ./test\n $(( 1 + my_array[1] ))\nEOF"
+
+prop_rcCanSuppressDfa = null result
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\nexit; foo;"
+    }
+
+prop_fileCanSuppressDfa = null $ traceShowId result
+  where
+    result = checkWithRc "" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;"
+    }
+
+prop_fileWinsWhenSuppressingDfa1 = null result
+  where
+    result = checkWithRc "extended-analysis=true" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;"
+    }
+
+prop_fileWinsWhenSuppressingDfa2 = result == [2317]
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=true\nexit; foo;"
+    }
+
+prop_flagWinsWhenSuppressingDfa1 = result == [2317]
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;",
+        csExtendedAnalysis = Just True
+    }
+
+prop_flagWinsWhenSuppressingDfa2 = null result
+  where
+    result = checkWithRc "extended-analysis=true" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=true\nexit; foo;",
+        csExtendedAnalysis = Just False
+    }
 
 return []
 runTests = $quickCheckAll

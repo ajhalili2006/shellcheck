@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2019 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -20,6 +20,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE PatternGuards #-}
 
 -- This module contains checks that examine specific commands by name.
 module ShellCheck.Checks.Commands (checker, optionalChecks, ShellCheck.Checks.Commands.runTests) where
@@ -27,20 +28,28 @@ module ShellCheck.Checks.Commands (checker, optionalChecks, ShellCheck.Checks.Co
 import ShellCheck.AST
 import ShellCheck.ASTLib
 import ShellCheck.AnalyzerLib
+import ShellCheck.CFG
+import qualified ShellCheck.CFGAnalysis as CF
 import ShellCheck.Data
 import ShellCheck.Interface
 import ShellCheck.Parser
+import ShellCheck.Prelude
 import ShellCheck.Regex
 
 import Control.Monad
 import Control.Monad.RWS
 import Data.Char
 import Data.Functor.Identity
+import qualified Data.Graph.Inductive.Graph as G
 import Data.List
 import Data.Maybe
-import qualified Data.Map.Strict as Map
+import qualified Data.List.NonEmpty as NE
+import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import Test.QuickCheck.All (forAllProperties)
 import Test.QuickCheck.Test (quickCheckWithResult, stdArgs, maxSuccess)
+
+import Debug.Trace -- STRIP
 
 data CommandName = Exactly String | Basename String
     deriving (Eq, Ord)
@@ -98,8 +107,10 @@ commandChecks = [
     ,checkUnquotedEchoSpaces
     ,checkEvalArray
     ]
-    ++ map checkArgComparison declaringCommands
+    ++ map checkArgComparison ("alias" : declaringCommands)
     ++ map checkMaskedReturns declaringCommands
+    ++ map checkMultipleDeclaring declaringCommands
+    ++ map checkBackreferencingDeclaration declaringCommands
 
 
 optionalChecks = map fst optionalCommandChecks
@@ -112,7 +123,7 @@ optionalCommandChecks = [
         cdNegative = "command -v javac"
     }, checkWhich)
     ]
-optionalCheckMap = Map.fromList $ map (\(desc, check) -> (cdName desc, check)) optionalCommandChecks
+optionalCheckMap = M.fromList $ map (\(desc, check) -> (cdName desc, check)) optionalCommandChecks
 
 prop_verifyOptionalExamples = all check optionalCommandChecks
   where
@@ -161,27 +172,26 @@ prop_checkGenericOptsT1 = checkGetOpts "-x -- -y" ["x"] ["-y"] $ return . getGen
 prop_checkGenericOptsT2 = checkGetOpts "-xy --" ["x", "y"] [] $ return . getGenericOpts
 
 
-buildCommandMap :: [CommandCheck] -> Map.Map CommandName (Token -> Analysis)
-buildCommandMap = foldl' addCheck Map.empty
+buildCommandMap :: [CommandCheck] -> M.Map CommandName (Token -> Analysis)
+buildCommandMap = foldl' addCheck M.empty
   where
     addCheck map (CommandCheck name function) =
-        Map.insertWith composeAnalyzers name function map
+        M.insertWith composeAnalyzers name function map
 
 
-checkCommand :: Map.Map CommandName (Token -> Analysis) -> Token -> Analysis
+checkCommand :: M.Map CommandName (Token -> Analysis) -> Token -> Analysis
 checkCommand map t@(T_SimpleCommand id cmdPrefix (cmd:rest)) = sequence_ $ do
     name <- getLiteralString cmd
     return $
-        if '/' `elem` name
-        then
-            Map.findWithDefault nullCheck (Basename $ basename name) map t
-        else if name == "builtin" && not (null rest) then
-            let t' = T_SimpleCommand id cmdPrefix rest
-                selectedBuiltin = fromMaybe "" $ getLiteralString . head $ rest
-            in Map.findWithDefault nullCheck (Exactly selectedBuiltin) map t'
-        else do
-            Map.findWithDefault nullCheck (Exactly name) map t
-            Map.findWithDefault nullCheck (Basename name) map t
+        if | '/' `elem` name ->
+               M.findWithDefault nullCheck (Basename $ basename name) map t
+           | name == "builtin", (h:_) <- rest ->
+               let t' = T_SimpleCommand id cmdPrefix rest
+                   selectedBuiltin = onlyLiteralString h
+               in M.findWithDefault nullCheck (Exactly selectedBuiltin) map t'
+           | otherwise -> do
+               M.findWithDefault nullCheck (Exactly name) map t
+               M.findWithDefault nullCheck (Basename name) map t
 
   where
     basename = reverse . takeWhile (/= '/') . reverse
@@ -203,22 +213,22 @@ checker spec params = getChecker $ commandChecks ++ optionals
     optionals =
         if "all" `elem` keys
         then map snd optionalCommandChecks
-        else mapMaybe (\x -> Map.lookup x optionalCheckMap) keys
+        else mapMaybe (\x -> M.lookup x optionalCheckMap) keys
 
 prop_checkTr1 = verify checkTr "tr [a-f] [A-F]"
 prop_checkTr2 = verify checkTr "tr 'a-z' 'A-Z'"
-prop_checkTr2a= verify checkTr "tr '[a-z]' '[A-Z]'"
+prop_checkTr2a = verify checkTr "tr '[a-z]' '[A-Z]'"
 prop_checkTr3 = verifyNot checkTr "tr -d '[:lower:]'"
-prop_checkTr3a= verifyNot checkTr "tr -d '[:upper:]'"
-prop_checkTr3b= verifyNot checkTr "tr -d '|/_[:upper:]'"
+prop_checkTr3a = verifyNot checkTr "tr -d '[:upper:]'"
+prop_checkTr3b = verifyNot checkTr "tr -d '|/_[:upper:]'"
 prop_checkTr4 = verifyNot checkTr "ls [a-z]"
 prop_checkTr5 = verify checkTr "tr foo bar"
 prop_checkTr6 = verify checkTr "tr 'hello' 'world'"
 prop_checkTr8 = verifyNot checkTr "tr aeiou _____"
 prop_checkTr9 = verifyNot checkTr "a-z n-za-m"
-prop_checkTr10= verifyNot checkTr "tr --squeeze-repeats rl lr"
-prop_checkTr11= verifyNot checkTr "tr abc '[d*]'"
-prop_checkTr12= verifyNot checkTr "tr '[=e=]' 'e'"
+prop_checkTr10 = verifyNot checkTr "tr --squeeze-repeats rl lr"
+prop_checkTr11 = verifyNot checkTr "tr abc '[d*]'"
+prop_checkTr12 = verifyNot checkTr "tr '[=e=]' 'e'"
 checkTr = CommandCheck (Basename "tr") (mapM_ f . arguments)
   where
     f w | isGlob w = -- The user will go [ab] -> '[ab]' -> 'ab'. Fixme?
@@ -290,7 +300,7 @@ checkExpr = CommandCheck (Basename "expr") f where
                     "'expr' expects 3+ arguments but sees 1. Make sure each operator/operand is a separate argument, and escape <>&|."
 
             [first, second] |
-                (fromMaybe "" $ getLiteralString first) /= "length"
+                onlyLiteralString first /= "length"
                   && not (willSplit first || willSplit second) -> do
                     checkOp first
                     warn (getId t) 2307
@@ -330,20 +340,20 @@ prop_checkGrepRe6 = verifyNot checkGrepRe "grep foo \\*.mp3"
 prop_checkGrepRe7 = verify checkGrepRe "grep *foo* file"
 prop_checkGrepRe8 = verify checkGrepRe "ls | grep foo*.jpg"
 prop_checkGrepRe9 = verifyNot checkGrepRe "grep '[0-9]*' file"
-prop_checkGrepRe10= verifyNot checkGrepRe "grep '^aa*' file"
-prop_checkGrepRe11= verifyNot checkGrepRe "grep --include=*.png foo"
-prop_checkGrepRe12= verifyNot checkGrepRe "grep -F 'Foo*' file"
-prop_checkGrepRe13= verifyNot checkGrepRe "grep -- -foo bar*"
-prop_checkGrepRe14= verifyNot checkGrepRe "grep -e -foo bar*"
-prop_checkGrepRe15= verifyNot checkGrepRe "grep --regex -foo bar*"
-prop_checkGrepRe16= verifyNot checkGrepRe "grep --include 'Foo*' file"
-prop_checkGrepRe17= verifyNot checkGrepRe "grep --exclude 'Foo*' file"
-prop_checkGrepRe18= verifyNot checkGrepRe "grep --exclude-dir 'Foo*' file"
-prop_checkGrepRe19= verify checkGrepRe "grep -- 'Foo*' file"
-prop_checkGrepRe20= verifyNot checkGrepRe "grep --fixed-strings 'Foo*' file"
-prop_checkGrepRe21= verifyNot checkGrepRe "grep -o 'x*' file"
-prop_checkGrepRe22= verifyNot checkGrepRe "grep --only-matching 'x*' file"
-prop_checkGrepRe23= verifyNot checkGrepRe "grep '.*' file"
+prop_checkGrepRe10 = verifyNot checkGrepRe "grep '^aa*' file"
+prop_checkGrepRe11 = verifyNot checkGrepRe "grep --include=*.png foo"
+prop_checkGrepRe12 = verifyNot checkGrepRe "grep -F 'Foo*' file"
+prop_checkGrepRe13 = verifyNot checkGrepRe "grep -- -foo bar*"
+prop_checkGrepRe14 = verifyNot checkGrepRe "grep -e -foo bar*"
+prop_checkGrepRe15 = verifyNot checkGrepRe "grep --regex -foo bar*"
+prop_checkGrepRe16 = verifyNot checkGrepRe "grep --include 'Foo*' file"
+prop_checkGrepRe17 = verifyNot checkGrepRe "grep --exclude 'Foo*' file"
+prop_checkGrepRe18 = verifyNot checkGrepRe "grep --exclude-dir 'Foo*' file"
+prop_checkGrepRe19 = verify checkGrepRe "grep -- 'Foo*' file"
+prop_checkGrepRe20 = verifyNot checkGrepRe "grep --fixed-strings 'Foo*' file"
+prop_checkGrepRe21 = verifyNot checkGrepRe "grep -o 'x*' file"
+prop_checkGrepRe22 = verifyNot checkGrepRe "grep --only-matching 'x*' file"
+prop_checkGrepRe23 = verifyNot checkGrepRe "grep '.*' file"
 
 checkGrepRe = CommandCheck (Basename "grep") check where
     check cmd = f cmd (arguments cmd)
@@ -391,7 +401,7 @@ checkGrepRe = CommandCheck (Basename "grep") check where
 
 
 prop_checkTrapQuotes1 = verify checkTrapQuotes "trap \"echo $num\" INT"
-prop_checkTrapQuotes1a= verify checkTrapQuotes "trap \"echo `ls`\" INT"
+prop_checkTrapQuotes1a = verify checkTrapQuotes "trap \"echo `ls`\" INT"
 prop_checkTrapQuotes2 = verifyNot checkTrapQuotes "trap 'echo $num' INT"
 prop_checkTrapQuotes3 = verify checkTrapQuotes "trap \"echo $((1+num))\" EXIT DEBUG"
 checkTrapQuotes = CommandCheck (Exactly "trap") (f . arguments) where
@@ -472,9 +482,16 @@ prop_checkUnusedEchoEscapes2 = verifyNot checkUnusedEchoEscapes "echo -e 'foi\\n
 prop_checkUnusedEchoEscapes3 = verify checkUnusedEchoEscapes "echo \"n:\\t42\""
 prop_checkUnusedEchoEscapes4 = verifyNot checkUnusedEchoEscapes "echo lol"
 prop_checkUnusedEchoEscapes5 = verifyNot checkUnusedEchoEscapes "echo -n -e '\n'"
+prop_checkUnusedEchoEscapes6 = verify checkUnusedEchoEscapes "echo '\\506'"
+prop_checkUnusedEchoEscapes7 = verify checkUnusedEchoEscapes "echo '\\5a'"
+prop_checkUnusedEchoEscapes8 = verifyNot checkUnusedEchoEscapes "echo '\\8a'"
+prop_checkUnusedEchoEscapes9 = verifyNot checkUnusedEchoEscapes "echo '\\d5a'"
+prop_checkUnusedEchoEscapes10 = verify checkUnusedEchoEscapes "echo '\\x4a'"
+prop_checkUnusedEchoEscapes11 = verify checkUnusedEchoEscapes "echo '\\xat'"
+prop_checkUnusedEchoEscapes12 = verifyNot checkUnusedEchoEscapes "echo '\\xth'"
 checkUnusedEchoEscapes = CommandCheck (Basename "echo") f
   where
-    hasEscapes = mkRegex "\\\\[rnt]"
+    hasEscapes = mkRegex "\\\\([rntabefv\\']|[0-7]{1,3}|x([0-9]|[A-F]|[a-f]){1,2})"
     f cmd =
         whenShell [Sh, Bash, Ksh] $
             unless (cmd `hasFlag` "e") $
@@ -648,19 +665,19 @@ prop_checkPrintfVar6 = verify checkPrintfVar "printf foo bar baz"
 prop_checkPrintfVar7 = verify checkPrintfVar "printf -- foo bar baz"
 prop_checkPrintfVar8 = verifyNot checkPrintfVar "printf '%s %s %s' \"${var[@]}\""
 prop_checkPrintfVar9 = verifyNot checkPrintfVar "printf '%s %s %s\\n' *.png"
-prop_checkPrintfVar10= verifyNot checkPrintfVar "printf '%s %s %s' foo bar baz"
-prop_checkPrintfVar11= verifyNot checkPrintfVar "printf '%(%s%s)T' -1"
-prop_checkPrintfVar12= verify checkPrintfVar "printf '%s %s\\n' 1 2 3"
-prop_checkPrintfVar13= verifyNot checkPrintfVar "printf '%s %s\\n' 1 2 3 4"
-prop_checkPrintfVar14= verify checkPrintfVar "printf '%*s\\n' 1"
-prop_checkPrintfVar15= verifyNot checkPrintfVar "printf '%*s\\n' 1 2"
-prop_checkPrintfVar16= verifyNot checkPrintfVar "printf $'string'"
-prop_checkPrintfVar17= verify checkPrintfVar "printf '%-*s\\n' 1"
-prop_checkPrintfVar18= verifyNot checkPrintfVar "printf '%-*s\\n' 1 2"
-prop_checkPrintfVar19= verifyNot checkPrintfVar "printf '%(%s)T'"
-prop_checkPrintfVar20= verifyNot checkPrintfVar "printf '%d %(%s)T' 42"
-prop_checkPrintfVar21= verify checkPrintfVar "printf '%d %(%s)T'"
-prop_checkPrintfVar22= verify checkPrintfVar "printf '%s\n%s' foo"
+prop_checkPrintfVar10 = verifyNot checkPrintfVar "printf '%s %s %s' foo bar baz"
+prop_checkPrintfVar11 = verifyNot checkPrintfVar "printf '%(%s%s)T' -1"
+prop_checkPrintfVar12 = verify checkPrintfVar "printf '%s %s\\n' 1 2 3"
+prop_checkPrintfVar13 = verifyNot checkPrintfVar "printf '%s %s\\n' 1 2 3 4"
+prop_checkPrintfVar14 = verify checkPrintfVar "printf '%*s\\n' 1"
+prop_checkPrintfVar15 = verifyNot checkPrintfVar "printf '%*s\\n' 1 2"
+prop_checkPrintfVar16 = verifyNot checkPrintfVar "printf $'string'"
+prop_checkPrintfVar17 = verify checkPrintfVar "printf '%-*s\\n' 1"
+prop_checkPrintfVar18 = verifyNot checkPrintfVar "printf '%-*s\\n' 1 2"
+prop_checkPrintfVar19 = verifyNot checkPrintfVar "printf '%(%s)T'"
+prop_checkPrintfVar20 = verifyNot checkPrintfVar "printf '%d %(%s)T' 42"
+prop_checkPrintfVar21 = verify checkPrintfVar "printf '%d %(%s)T'"
+prop_checkPrintfVar22 = verify checkPrintfVar "printf '%s\n%s' foo"
 
 checkPrintfVar = CommandCheck (Exactly "printf") (f . arguments) where
     f (doubledash:rest) | getLiteralString doubledash == Just "--" = f rest
@@ -674,6 +691,7 @@ checkPrintfVar = CommandCheck (Exactly "printf") (f . arguments) where
             let formats = getPrintfFormats string
             let formatCount = length formats
             let argCount = length more
+            let pluraliseIfMany word n = if n > 1 then word ++ "s" else word
 
             return $ if
                 | argCount == 0 && formatCount == 0 ->
@@ -689,7 +707,8 @@ checkPrintfVar = CommandCheck (Exactly "printf") (f . arguments) where
                     return () -- Great: a suitable number of arguments
                 | otherwise ->
                     warn (getId format) 2183 $
-                        "This format string has " ++ show formatCount ++ " variables, but is passed " ++ show argCount ++ " arguments."
+                        "This format string has " ++ show formatCount ++ " " ++ pluraliseIfMany "variable" formatCount ++
+                        ", but is passed " ++ show argCount ++ pluraliseIfMany " argument" argCount ++ "."
 
         unless ('%' `elem` concat (oversimplify format) || isLiteral format) $
           info (getId format) 2059
@@ -735,7 +754,7 @@ getPrintfFormats = getFormats
         --            \____ _____/\___ ____/   \____ ____/\_________ _________/ \______ /
         --                 V          V             V               V               V
         --               flags    field width  precision   format character        rest
-        -- field width and precision can be specified with a '*' instead of a digit,
+        -- field width and precision can be specified with an '*' instead of a digit,
         -- in which case printf will accept one more argument for each '*' used
 
 
@@ -912,7 +931,7 @@ prop_checkTimedCommand2 = verify checkTimedCommand "#!/bin/dash\ntime ( foo; bar
 prop_checkTimedCommand3 = verifyNot checkTimedCommand "#!/bin/sh\ntime sleep 1"
 checkTimedCommand = CommandCheck (Exactly "time") f where
     f (T_SimpleCommand _ _ (c:args@(_:_))) =
-        whenShell [Sh, Dash] $ do
+        whenShell [Sh, Dash, BusyboxSh] $ do
             let cmd = last args -- "time" is parsed with a command as argument
             when (isPiped cmd) $
                 warn (getId c) 2176 "'time' is undefined for pipelines. time single stage or bash -c instead."
@@ -936,10 +955,26 @@ checkTimedCommand = CommandCheck (Exactly "time") f where
 prop_checkLocalScope1 = verify checkLocalScope "local foo=3"
 prop_checkLocalScope2 = verifyNot checkLocalScope "f() { local foo=3; }"
 checkLocalScope = CommandCheck (Exactly "local") $ \t ->
-    whenShell [Bash, Dash] $ do -- Ksh allows it, Sh doesn't support local
+    whenShell [Bash, Dash, BusyboxSh] $ do -- Ksh allows it, Sh doesn't support local
         path <- getPathM t
         unless (any isFunctionLike path) $
             err (getId $ getCommandTokenOrThis t) 2168 "'local' is only valid in functions."
+
+prop_checkMultipleDeclaring1 = verify (checkMultipleDeclaring "local") "q() { local readonly var=1; }"
+prop_checkMultipleDeclaring2 = verifyNot (checkMultipleDeclaring "local") "q() { local var=1; }"
+prop_checkMultipleDeclaring3 = verify (checkMultipleDeclaring "readonly") "readonly local foo=5"
+prop_checkMultipleDeclaring4 = verify (checkMultipleDeclaring "export") "export readonly foo=5"
+prop_checkMultipleDeclaring5 = verifyNot (checkMultipleDeclaring "local") "f() { local -r foo=5; }"
+prop_checkMultipleDeclaring6 = verifyNot (checkMultipleDeclaring "declare") "declare -rx foo=5"
+prop_checkMultipleDeclaring7 = verifyNot (checkMultipleDeclaring "readonly") "readonly 'local' foo=5"
+checkMultipleDeclaring cmd = CommandCheck (Exactly cmd) (mapM_ check . arguments)
+  where
+    check t = sequence_ $ do
+        lit <- getUnquotedLiteral t
+        guard $ lit `elem` declaringCommands
+        return $ err (getId $ getCommandTokenOrThis t) 2316 $
+                 "This applies " ++ cmd ++ " to the variable named " ++ lit ++
+                 ", which is probably not what you want. Use a separate command or the appropriate `declare` options instead."
 
 prop_checkDeprecatedTempfile1 = verify checkDeprecatedTempfile "var=$(tempfile)"
 prop_checkDeprecatedTempfile2 = verifyNot checkDeprecatedTempfile "tempfile=$(mktemp)"
@@ -971,8 +1006,8 @@ checkWhileGetoptsCase = CommandCheck (Exactly "getopts") f
         sequence_ $ do
             options <- getLiteralString arg1
             getoptsVar <- getLiteralString name
-            (T_WhileExpression _ _ body) <- findFirst whileLoop path
-            caseCmd@(T_CaseExpression _ var _) <- mapMaybe findCase body !!! 0
+            (T_WhileExpression _ _ body) <- findFirst whileLoop (NE.toList path)
+            T_CaseExpression id var list <- mapMaybe findCase body !!! 0
 
             -- Make sure getopts name and case variable matches
             [T_DollarBraced _ _ bracedWord] <- return $ getWordParts var
@@ -982,25 +1017,25 @@ checkWhileGetoptsCase = CommandCheck (Exactly "getopts") f
             -- Make sure the variable isn't modified
             guard . not $ modifiesVariable params (T_BraceGroup (Id 0) body) getoptsVar
 
-            return $ check (getId arg1) (map (:[]) $ filter (/= ':') options) caseCmd
+            return $ check (getId arg1) (map (:[]) $ filter (/= ':') options) id list
     f _ = return ()
 
-    check :: Id -> [String] -> Token -> Analysis
-    check optId opts (T_CaseExpression id _ list) = do
-            unless (Nothing `Map.member` handledMap) $ do
-                mapM_ (warnUnhandled optId id) $ catMaybes $ Map.keys notHandled
+    check :: Id -> [String] -> Id -> [(CaseType, [Token], [Token])] -> Analysis
+    check optId opts id list = do
+            unless (Nothing `M.member` handledMap) $ do
+                mapM_ (warnUnhandled optId id) $ catMaybes $ M.keys notHandled
 
-                unless (any (`Map.member` handledMap) [Just "*",Just "?"]) $
+                unless (any (`M.member` handledMap) [Just "*",Just "?"]) $
                     warn id 2220 "Invalid flags are not handled. Add a *) case."
 
-            mapM_ warnRedundant $ Map.toList notRequested
+            mapM_ warnRedundant $ M.toList notRequested
 
         where
-            handledMap = Map.fromList (concatMap getHandledStrings list)
-            requestedMap = Map.fromList $ map (\x -> (Just x, ())) opts
+            handledMap = M.fromList (concatMap getHandledStrings list)
+            requestedMap = M.fromList $ map (\x -> (Just x, ())) opts
 
-            notHandled = Map.difference requestedMap handledMap
-            notRequested = Map.difference handledMap requestedMap
+            notHandled = M.difference requestedMap handledMap
+            notRequested = M.difference handledMap requestedMap
 
     warnUnhandled optId caseId str =
         warn caseId 2213 $ "getopts specified -" ++ (e4m str) ++ ", but it's not handled by this 'case'."
@@ -1044,10 +1079,10 @@ prop_checkCatastrophicRm4 = verify checkCatastrophicRm "rm -fr /home/$(whoami)/*
 prop_checkCatastrophicRm5 = verifyNot checkCatastrophicRm "rm -r /home/${USER:-thing}/*"
 prop_checkCatastrophicRm6 = verify checkCatastrophicRm "rm --recursive /etc/*$config*"
 prop_checkCatastrophicRm8 = verify checkCatastrophicRm "rm -rf /home"
-prop_checkCatastrophicRm10= verifyNot checkCatastrophicRm "rm -r \"${DIR}\"/{.gitignore,.gitattributes,ci}"
-prop_checkCatastrophicRm11= verify checkCatastrophicRm "rm -r /{bin,sbin}/$exec"
-prop_checkCatastrophicRm12= verify checkCatastrophicRm "rm -r /{{usr,},{bin,sbin}}/$exec"
-prop_checkCatastrophicRm13= verifyNot checkCatastrophicRm "rm -r /{{a,b},{c,d}}/$exec"
+prop_checkCatastrophicRm10 = verifyNot checkCatastrophicRm "rm -r \"${DIR}\"/{.gitignore,.gitattributes,ci}"
+prop_checkCatastrophicRm11 = verify checkCatastrophicRm "rm -r /{bin,sbin}/$exec"
+prop_checkCatastrophicRm12 = verify checkCatastrophicRm "rm -r /{{usr,},{bin,sbin}}/$exec"
+prop_checkCatastrophicRm13 = verifyNot checkCatastrophicRm "rm -r /{{a,b},{c,d}}/$exec"
 prop_checkCatastrophicRmA = verify checkCatastrophicRm "rm -rf /usr /lib/nvidia-current/xorg/xorg"
 prop_checkCatastrophicRmB = verify checkCatastrophicRm "rm -rf \"$STEAMROOT/\"*"
 checkCatastrophicRm = CommandCheck (Basename "rm") $ \t ->
@@ -1202,8 +1237,7 @@ checkSudoArgs = CommandCheck (Basename "sudo") f
   where
     f t = sequence_ $ do
         opts <- parseOpts $ arguments t
-        let nonFlags = [x | ("",(x, _)) <- opts]
-        commandArg <- nonFlags !!! 0
+        (_,(commandArg, _)) <- find (null . fst) opts
         command <- getLiteralString commandArg
         guard $ command `elem` builtins
         return $ warn (getId t) 2232 $ "Can't use sudo with builtins like " ++ command ++ ". Did you want sudo sh -c .. instead?"
@@ -1253,6 +1287,7 @@ prop_checkArgComparison3 = verifyNot (checkArgComparison "declare") "declare a=b
 prop_checkArgComparison4 = verify (checkArgComparison "export") "export a +=b"
 prop_checkArgComparison7 = verifyNot (checkArgComparison "declare") "declare -a +i foo"
 prop_checkArgComparison8 = verify (checkArgComparison "let") "let x = 0"
+prop_checkArgComparison9 = verify (checkArgComparison "alias") "alias x =0"
 -- This mirrors checkSecondArgIsComparison but for arguments to local/readonly/declare/export
 checkArgComparison cmd = CommandCheck (Exactly cmd) wordsWithEqual
   where
@@ -1353,10 +1388,10 @@ checkUnquotedEchoSpaces = CommandCheck (Basename "echo") check
         m <- asks tokenPositions
         redir <- getClosestCommandM t
         sequence_ $ do
-            let positions = mapMaybe (\c -> Map.lookup (getId c) m) args
+            let positions = mapMaybe (\c -> M.lookup (getId c) m) args
             let pairs = zip positions (drop 1 positions)
             (T_Redirecting _ redirTokens _) <- redir
-            let redirPositions = mapMaybe (\c -> fst <$> Map.lookup (getId c) m) redirTokens
+            let redirPositions = mapMaybe (\c -> fst <$> M.lookup (getId c) m) redirTokens
             guard $ any (hasSpacesBetween redirPositions) pairs
             return $ info (getId t) 2291 "Quote repeated spaces to avoid them collapsing into one."
 
@@ -1384,6 +1419,53 @@ checkEvalArray = CommandCheck (Exactly "eval") (mapM_ check . concatMap getWordP
             -- Match ${arr[@]@Q} and ${@@Q} and such
             T_DollarBraced _ _ l -> 'Q' `elem` getBracedModifier (concat $ oversimplify l)
             _ -> False
+
+
+prop_checkBackreferencingDeclaration1 = verify (checkBackreferencingDeclaration "declare") "declare x=1 y=foo$x"
+prop_checkBackreferencingDeclaration2 = verify (checkBackreferencingDeclaration "readonly") "readonly x=1 y=$((1+x))"
+prop_checkBackreferencingDeclaration3 = verify (checkBackreferencingDeclaration "local") "local x=1 y=$(echo $x)"
+prop_checkBackreferencingDeclaration4 = verify (checkBackreferencingDeclaration "local") "local x=1 y[$x]=z"
+prop_checkBackreferencingDeclaration5 = verify (checkBackreferencingDeclaration "declare") "declare x=var $x=1"
+prop_checkBackreferencingDeclaration6 = verify (checkBackreferencingDeclaration "declare") "declare x=var $x=1"
+prop_checkBackreferencingDeclaration7 = verify (checkBackreferencingDeclaration "declare") "declare x=var $k=$x"
+checkBackreferencingDeclaration cmd = CommandCheck (Exactly cmd) check
+  where
+    check t = do
+        maybeCfga <- asks cfgAnalysis
+        mapM_ (\cfga -> foldM_ (perArg cfga) M.empty $ arguments t) maybeCfga
+
+    perArg cfga leftArgs t =
+        case t of
+            T_Assignment id _ name idx t -> do
+                warnIfBackreferencing cfga leftArgs $ t:idx
+                return $ M.insert name id leftArgs
+            t -> do
+                warnIfBackreferencing cfga leftArgs [t]
+                return leftArgs
+
+    warnIfBackreferencing cfga backrefs l = do
+        references <- findReferences cfga l
+        let reused = M.intersection backrefs references
+        mapM msg $ M.toList reused
+
+    msg (name, id) = warn id 2318 $ "This assignment is used again in this '" ++ cmd ++ "', but won't have taken effect. Use two '" ++ cmd ++ "'s."
+
+    findReferences cfga list = do
+        let graph = CF.graph cfga
+        let nodesMap = CF.tokenToNodes cfga
+        let nodes = S.unions $ map (\id -> M.findWithDefault S.empty id nodesMap) $ map getId $ list
+        let labels = mapMaybe (G.lab graph) $ S.toList nodes
+        let references = M.fromList $ concatMap refFromLabel labels
+        return references
+
+    refFromLabel lab =
+        case lab of
+            CFApplyEffects effects -> mapMaybe refFromEffect effects
+            _ -> []
+    refFromEffect e =
+        case e of
+            IdTagged id (CFReadVariable name) -> return (name, id)
+            _ -> Nothing
 
 
 return []

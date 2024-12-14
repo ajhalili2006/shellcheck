@@ -56,6 +56,13 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
     options are cumulative, but all the codes can be specified at once,
     comma-separated as a single argument.
 
+**--extended-analysis=true/false**
+
+:   Enable/disable Dataflow Analysis to identify more issues (default true). If
+    ShellCheck uses too much CPU/RAM when checking scripts with several
+    thousand lines of code, extended analysis can be disabled with this flag
+    or a directive. This flag overrides directives and rc files.
+
 **-f** *FORMAT*, **--format=***FORMAT*
 
 :   Specify the output format of shellcheck, which prints its results in the
@@ -71,6 +78,11 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 :   Don't try to look for .shellcheckrc configuration files.
 
+--rcfile\ RCFILE
+
+:   Prefer the specified configuration file over searching for one
+    in the default locations.
+
 **-o**\ *NAME1*[,*NAME2*...],\ **--enable=***NAME1*[,*NAME2*...]
 
 :   Enable optional checks. The special name *all* enables all of them.
@@ -85,7 +97,8 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 **-s**\ *shell*,\ **--shell=***shell*
 
-:   Specify Bourne shell dialect. Valid values are *sh*, *bash*, *dash* and *ksh*.
+:   Specify Bourne shell dialect. Valid values are *sh*, *bash*, *dash*, *ksh*,
+    and *busybox*.
     The default is to deduce the shell from the file's `shell` directive,
     shebang, or `.bash/.bats/.dash/.ksh` extension, in that order. *sh* refers to
     POSIX `sh` (not the system's), and will warn of portability issues.
@@ -243,6 +256,12 @@ Valid keys are:
 :   Enable an optional check by name, as listed with **--list-optional**.
     Only file-wide `enable` directives are considered.
 
+**extended-analysis**
+:   Set to true/false to enable/disable dataflow analysis. Specifying
+    `# shellcheck extended-analysis=false` in particularly large (2000+ line)
+    auto-generated scripts will reduce ShellCheck's resource usage at the
+    expense of certain checks. Extended analysis is enabled by default.
+
 **external-sources**
 :   Set to `true` in `.shellcheckrc` to always allow ShellCheck to open
     arbitrary files from 'source' statements (the way most tools do).
@@ -281,6 +300,9 @@ Here is an example `.shellcheckrc`:
     # and also look for absolute paths in /mnt/chroot
     source-path=SCRIPTDIR
     source-path=/mnt/chroot
+
+    # Since 0.9.0, values can be quoted with '' or "" to allow spaces
+    source-path="My Documents/scripts"
 
     # Allow opening any 'source'd file, even if not specified as input
     external-sources=true
@@ -375,7 +397,7 @@ long list of wonderful contributors.
 
 # COPYRIGHT
 
-Copyright 2012-2019, Vidar Holen and contributors.
+Copyright 2012-2024, Vidar Holen and contributors.
 Licensed under the GNU General Public License version 3 or later,
 see https://gnu.org/licenses/gpl.html
 

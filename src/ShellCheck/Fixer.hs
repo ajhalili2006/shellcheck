@@ -22,6 +22,8 @@
 module ShellCheck.Fixer (applyFix, removeTabStops, mapPositions, Ranged(..), runTests) where
 
 import ShellCheck.Interface
+import ShellCheck.Prelude
+import Control.Monad
 import Control.Monad.State
 import Data.Array
 import Data.List
@@ -35,7 +37,7 @@ class Ranged a where
     end     :: a -> Position
     overlap :: a -> a -> Bool
     overlap x y =
-        (yStart >= xStart && yStart < xEnd) || (yStart < xStart && yEnd > xStart)
+        xEnd > yStart && yEnd > xStart
         where
             yStart = start y
             yEnd = end y
@@ -86,6 +88,7 @@ instance Ranged Replacement where
 instance Monoid Fix where
     mempty = newFix
     mappend = (<>)
+    mconcat = foldl mappend mempty -- fold left to right since <> discards right on overlap
 
 instance Semigroup Fix where
     f1 <> f2 =
@@ -228,7 +231,7 @@ applyReplacement2 rep string = do
 
     let (l1, l2) = tmap posLine originalPos in
         when (l1 /= 1 || l2 /= 1) $
-            error "ShellCheck internal error, please report: bad cross-line fix"
+            error $ pleaseReport "bad cross-line fix"
 
     let replacer = repString rep
     let shift = (length replacer) - (oldEnd - oldStart)

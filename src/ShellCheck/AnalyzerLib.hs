@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2019 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -23,13 +23,16 @@ module ShellCheck.AnalyzerLib where
 
 import ShellCheck.AST
 import ShellCheck.ASTLib
+import qualified ShellCheck.CFGAnalysis as CF
 import ShellCheck.Data
 import ShellCheck.Interface
 import ShellCheck.Parser
+import ShellCheck.Prelude
 import ShellCheck.Regex
 
 import Control.Arrow (first)
 import Control.DeepSeq
+import Control.Monad
 import Control.Monad.Identity
 import Control.Monad.RWS
 import Control.Monad.State
@@ -38,6 +41,7 @@ import Data.Char
 import Data.List
 import Data.Maybe
 import Data.Semigroup
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 
 import Test.QuickCheck.All (forAllProperties)
@@ -87,6 +91,8 @@ data Parameters = Parameters {
     hasPipefail        :: Bool,
     -- A linear (bad) analysis of data flow
     variableFlow       :: [StackData],
+    -- A map from Id to Token
+    idMap              :: Map.Map Id Token,
     -- A map from Id to parent Token
     parentMap          :: Map.Map Id Token,
     -- The shell type, such as Bash or Ksh
@@ -96,7 +102,9 @@ data Parameters = Parameters {
     -- The root node of the AST
     rootNode           :: Token,
     -- map from token id to start and end position
-    tokenPositions     :: Map.Map Id (Position, Position)
+    tokenPositions     :: Map.Map Id (Position, Position),
+    -- Result from Control Flow Graph analysis (including data flow analysis)
+    cfgAnalysis :: Maybe CF.CFGAnalysis
     } deriving (Show)
 
 -- TODO: Cache results of common AST ops here
@@ -189,35 +197,49 @@ makeCommentWithFix severity id code str fix =
         }
     in force withFix
 
-makeParameters spec =
-    let params = Parameters {
+-- makeParameters :: CheckSpec -> Parameters
+makeParameters spec = params
+  where
+    extendedAnalysis = fromMaybe True $ msum [asExtendedAnalysis spec, getExtendedAnalysisDirective root]
+    params = Parameters {
         rootNode = root,
         shellType = fromMaybe (determineShell (asFallbackShell spec) root) $ asShellType spec,
         hasSetE = containsSetE root,
         hasLastpipe =
             case shellType params of
-                Bash -> containsLastpipe root
+                Bash -> isOptionSet "lastpipe" root
                 Dash -> False
+                BusyboxSh -> False
                 Sh   -> False
                 Ksh  -> True,
         hasInheritErrexit =
             case shellType params of
-                Bash -> containsInheritErrexit root
+                Bash -> isOptionSet "inherit_errexit" root
                 Dash -> True
+                BusyboxSh -> True
                 Sh   -> True
                 Ksh  -> False,
         hasPipefail =
             case shellType params of
-                Bash -> containsPipefail root
+                Bash -> isOptionSet "pipefail" root
                 Dash -> True
+                BusyboxSh -> isOptionSet "pipefail" root
                 Sh   -> True
-                Ksh  -> containsPipefail root,
+                Ksh  -> isOptionSet "pipefail" root,
         shellTypeSpecified = isJust (asShellType spec) || isJust (asFallbackShell spec),
+        idMap = getTokenMap root,
         parentMap = getParentTree root,
         variableFlow = getVariableFlow params root,
-        tokenPositions = asTokenPositions spec
-    } in params
-  where root = asScript spec
+        tokenPositions = asTokenPositions spec,
+        cfgAnalysis = do
+            guard extendedAnalysis
+            return $ CF.analyzeControlFlow cfParams root
+    }
+    cfParams = CF.CFGParameters {
+        CF.cfLastpipe = hasLastpipe params,
+        CF.cfPipefail = hasPipefail params
+    }
+    root = asScript spec
 
 
 -- Does this script mention 'set -e' anywhere?
@@ -234,13 +256,14 @@ containsSetE root = isNothing $ doAnalysis (guard . not . isSetE) root
             _ -> False
     re = mkRegex "[[:space:]]-[^-]*e"
 
-containsPipefail root = isNothing $ doAnalysis (guard . not . isPipefail) root
+
+containsSetOption opt root = isNothing $ doAnalysis (guard . not . isPipefail) root
   where
     isPipefail t =
         case t of
             T_SimpleCommand {}  ->
                 t `isUnqualifiedCommand` "set" &&
-                    ("pipefail" `elem` oversimplify t ||
+                    (opt `elem` oversimplify t ||
                         "o" `elem` map snd (getAllFlags t))
             _ -> False
 
@@ -254,12 +277,8 @@ containsShopt shopt root =
                         (shopt `elem` oversimplify t)
                 _ -> False
 
--- Does this script mention 'shopt -s inherit_errexit' anywhere?
-containsInheritErrexit = containsShopt "inherit_errexit"
-
--- Does this script mention 'shopt -s lastpipe' anywhere?
--- Also used as a hack.
-containsLastpipe = containsShopt "lastpipe"
+-- Does this script mention 'shopt -s $opt' or 'set -o $opt' anywhere?
+isOptionSet opt root = containsShopt opt root || containsSetOption opt root
 
 
 prop_determineShell0 = determineShellTest "#!/bin/sh" == Sh
@@ -273,8 +292,8 @@ prop_determineShell7 = determineShellTest "#! /bin/ash" == Dash
 prop_determineShell8 = determineShellTest' (Just Ksh) "#!/bin/sh" == Sh
 prop_determineShell9 = determineShellTest "#!/bin/env -S dash -x" == Dash
 prop_determineShell10 = determineShellTest "#!/bin/env --split-string= dash -x" == Dash
-prop_determineShell11 = determineShellTest "#!/bin/busybox sh" == Dash -- busybox sh is a specific shell, not posix sh
-prop_determineShell12 = determineShellTest "#!/bin/busybox ash" == Dash
+prop_determineShell11 = determineShellTest "#!/bin/busybox sh" == BusyboxSh -- busybox sh is a specific shell, not posix sh
+prop_determineShell12 = determineShellTest "#!/bin/busybox ash" == BusyboxSh
 
 determineShellTest = determineShellTest' Nothing
 determineShellTest' fallbackShell = determineShell fallbackShell . fromJust . prRoot . pScript
@@ -322,14 +341,14 @@ isQuoteFree = isQuoteFreeNode False
 
 isQuoteFreeNode strict shell tree t =
     isQuoteFreeElement t ||
-        (fromMaybe False $ msum $ map isQuoteFreeContext $ drop 1 $ getPath tree t)
+        (fromMaybe False $ msum $ map isQuoteFreeContext $ NE.tail $ getPath tree t)
   where
     -- Is this node self-quoting in itself?
     isQuoteFreeElement t =
         case t of
-            T_Assignment {} -> assignmentIsQuoting t
-            T_FdRedirect {} -> True
-            _               -> False
+            T_Assignment id _ _ _ _ -> assignmentIsQuoting id
+            T_FdRedirect {}         -> True
+            _                       -> False
 
     -- Are any subnodes inherently self-quoting?
     isQuoteFreeContext t =
@@ -339,7 +358,7 @@ isQuoteFreeNode strict shell tree t =
             TC_Binary _ DoubleBracket _ _ _ -> return True
             TA_Sequence {}                  -> return True
             T_Arithmetic {}                 -> return True
-            T_Assignment {}                 -> return $ assignmentIsQuoting t
+            T_Assignment id _ _ _ _         -> return $ assignmentIsQuoting id
             T_Redirecting {}                -> return False
             T_DoubleQuoted _ _              -> return True
             T_DollarDoubleQuoted _ _        -> return True
@@ -351,14 +370,14 @@ isQuoteFreeNode strict shell tree t =
             T_SelectIn {}                   -> return (not strict)
             _                               -> Nothing
 
-    -- Check whether this assigment is self-quoting due to being a recognized
+    -- Check whether this assignment is self-quoting due to being a recognized
     -- assignment passed to a Declaration Utility. This will soon be required
     -- by POSIX: https://austingroupbugs.net/view.php?id=351
-    assignmentIsQuoting t = shellParsesParamsAsAssignments || not (isAssignmentParamToCommand t)
+    assignmentIsQuoting id = shellParsesParamsAsAssignments || not (isAssignmentParamToCommand id)
     shellParsesParamsAsAssignments = shell /= Sh
 
     -- Is this assignment a parameter to a command like export/typeset/etc?
-    isAssignmentParamToCommand (T_Assignment id _ _ _ _) =
+    isAssignmentParamToCommand id =
         case Map.lookup id tree of
             Just (T_SimpleCommand _ _ (_:args)) -> id `elem` (map getId args)
             _ -> False
@@ -384,7 +403,7 @@ isParamTo tree cmd =
 -- Get the parent command (T_Redirecting) of a Token, if any.
 getClosestCommand :: Map.Map Id Token -> Token -> Maybe Token
 getClosestCommand tree t =
-    findFirst findCommand $ getPath tree t
+    findFirst findCommand $ NE.toList $ getPath tree t
   where
     findCommand t =
         case t of
@@ -398,7 +417,7 @@ getClosestCommandM t = do
     return $ getClosestCommand (parentMap params) t
 
 -- Is the token used as a command name (the first word in a T_SimpleCommand)?
-usedAsCommandName tree token = go (getId token) (tail $ getPath tree token)
+usedAsCommandName tree token = go (getId token) (NE.tail $ getPath tree token)
   where
     go currentId (T_NormalWord id [word]:rest)
         | currentId == getId word = go id rest
@@ -408,12 +427,6 @@ usedAsCommandName tree token = go (getId token) (tail $ getPath tree token)
         getId word == currentId || getId (getCommandTokenOrThis t) == currentId
     go _ _ = False
 
--- A list of the element and all its parents up to the root node.
-getPath tree t = t :
-    case Map.lookup (getId t) tree of
-        Nothing     -> []
-        Just parent -> getPath tree parent
-
 -- Version of the above taking the map from the current context
 -- Todo: give this the name "getPath"
 getPathM t = do
@@ -421,7 +434,9 @@ getPathM t = do
     return $ getPath (parentMap params) t
 
 isParentOf tree parent child =
-    elem (getId parent) . map getId $ getPath tree child
+    any (\t -> parentId == getId t) (getPath tree child)
+  where
+    parentId = getId parent
 
 parents params = getPath (parentMap params)
 
@@ -511,18 +526,18 @@ getModifiedVariables t =
         T_SimpleCommand {} ->
             getModifiedVariableCommand t
 
-        TA_Unary _ "++|" v@(TA_Variable _ name _)  ->
-            [(t, v, name, DataString $ SourceFrom [v])]
-        TA_Unary _ "|++" v@(TA_Variable _ name _)  ->
-            [(t, v, name, DataString $ SourceFrom [v])]
+        TA_Unary _ op v@(TA_Variable _ name _) | "--" `isInfixOf` op || "++" `isInfixOf` op ->
+            [(t, v, name, DataString SourceInteger)]
         TA_Assignment _ op (TA_Variable _ name _) rhs -> do
             guard $ op `elem` ["=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|="]
-            return (t, t, name, DataString $ SourceFrom [rhs])
+            return (t, t, name, DataString SourceInteger)
 
         T_BatsTest {} -> [
             (t, t, "lines", DataArray SourceExternal),
             (t, t, "status", DataString SourceInteger),
-            (t, t, "output", DataString SourceExternal)
+            (t, t, "output", DataString SourceExternal),
+            (t, t, "stderr", DataString SourceExternal),
+            (t, t, "stderr_lines", DataArray SourceExternal)
             ]
 
         -- Count [[ -v foo ]] as an "assignment".
@@ -544,8 +559,12 @@ getModifiedVariables t =
         T_FdRedirect _ ('{':var) op -> -- {foo}>&2 modifies foo
             [(t, t, takeWhile (/= '}') var, DataString SourceInteger) | not $ isClosingFileOp op]
 
-        T_CoProc _ name _ ->
-            [(t, t, fromMaybe "COPROC" name, DataArray SourceInteger)]
+        T_CoProc _ Nothing _ ->
+            [(t, t, "COPROC", DataArray SourceInteger)]
+
+        T_CoProc _ (Just token) _ -> do
+            name <- maybeToList $ getLiteralString token
+            [(t, t, name, DataArray SourceInteger)]
 
         --Points to 'for' rather than variable
         T_ForIn id str [] _ -> [(t, t, str, DataString SourceExternal)]
@@ -560,12 +579,6 @@ getModifiedVariables t =
                     guard $ isVariableName str
                     return (place, t, str, DataString SourceChecked)
             _ -> Nothing
-
-isClosingFileOp op =
-    case op of
-        T_IoDuplicate _ (T_GREATAND _) "-" -> True
-        T_IoDuplicate _ (T_LESSAND  _) "-" -> True
-        _                                  -> False
 
 
 -- Consider 'export/declare -x' a reference, since it makes the var available
@@ -748,13 +761,6 @@ getModifiedVariableCommand base@(T_SimpleCommand id cmdPrefix (T_NormalWord _ (T
 
 getModifiedVariableCommand _ = []
 
-getIndexReferences s = fromMaybe [] $ do
-    match <- matchRegex re s
-    index <- match !!! 0
-    return $ matchAllStrings variableNameRegex index
-  where
-    re = mkRegex "(\\[.*\\])"
-
 -- Given a NormalWord like foo or foo[$bar], get foo.
 -- Primarily used to get references for [[ -v foo[bar] ]]
 getVariableForTestDashV :: Token -> Maybe String
@@ -768,18 +774,6 @@ getVariableForTestDashV t = do
     -- Turn foo[$x] into foo[\0] so that we can get the constant array name
     -- in a non-constant expression (while filtering out foo$x[$y])
     toStr _ = return "\0"
-
-prop_getOffsetReferences1 = getOffsetReferences ":bar" == ["bar"]
-prop_getOffsetReferences2 = getOffsetReferences ":bar:baz" == ["bar", "baz"]
-prop_getOffsetReferences3 = getOffsetReferences "[foo]:bar" == ["bar"]
-prop_getOffsetReferences4 = getOffsetReferences "[foo]:bar:baz" == ["bar", "baz"]
-getOffsetReferences mods = fromMaybe [] $ do
--- if mods start with [, then drop until ]
-    match <- matchRegex re mods
-    offsets <- match !!! 1
-    return $ matchAllStrings variableNameRegex offsets
-  where
-    re = mkRegex "^(\\[.+\\])? *:([^-=?+].*)"
 
 getReferencedVariables parents t =
     case t of
@@ -832,7 +826,7 @@ getReferencedVariables parents t =
             return (context, token, getBracedReference str)
 
     isArithmeticAssignment t = case getPath parents t of
-        this: TA_Assignment _ "=" lhs _ :_ -> lhs == t
+        this NE.:| TA_Assignment _ "=" lhs _ :_ -> lhs == t
         _                                  -> False
 
 isDereferencingBinaryOp = (`elem` ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"])
@@ -859,17 +853,6 @@ isConfusedGlobRegex ('*':_) = True
 isConfusedGlobRegex [x,'*'] | x `notElem` "\\." = True
 isConfusedGlobRegex _       = False
 
-isVariableStartChar x = x == '_' || isAsciiLower x || isAsciiUpper x
-isVariableChar x = isVariableStartChar x || isDigit x
-isSpecialVariableChar = (`elem` "*@#?-$!")
-variableNameRegex = mkRegex "[_a-zA-Z][_a-zA-Z0-9]*"
-
-prop_isVariableName1 = isVariableName "_fo123"
-prop_isVariableName2 = not $ isVariableName "4"
-prop_isVariableName3 = not $ isVariableName "test: "
-isVariableName (x:r) = isVariableStartChar x && all isVariableChar r
-isVariableName _     = False
-
 getVariablesFromLiteralToken token =
     getVariablesFromLiteral (getLiteralStringDef " " token)
 
@@ -882,73 +865,6 @@ getVariablesFromLiteral string =
   where
     variableRegex = mkRegex "\\$\\{?([A-Za-z0-9_]+)"
 
--- Get the variable name from an expansion like ${var:-foo}
-prop_getBracedReference1 = getBracedReference "foo" == "foo"
-prop_getBracedReference2 = getBracedReference "#foo" == "foo"
-prop_getBracedReference3 = getBracedReference "#" == "#"
-prop_getBracedReference4 = getBracedReference "##" == "#"
-prop_getBracedReference5 = getBracedReference "#!" == "!"
-prop_getBracedReference6 = getBracedReference "!#" == "#"
-prop_getBracedReference7 = getBracedReference "!foo#?" == "foo"
-prop_getBracedReference8 = getBracedReference "foo-bar" == "foo"
-prop_getBracedReference9 = getBracedReference "foo:-bar" == "foo"
-prop_getBracedReference10= getBracedReference "foo: -1" == "foo"
-prop_getBracedReference11= getBracedReference "!os*" == ""
-prop_getBracedReference11b= getBracedReference "!os@" == ""
-prop_getBracedReference12= getBracedReference "!os?bar**" == ""
-prop_getBracedReference13= getBracedReference "foo[bar]" == "foo"
-getBracedReference s = fromMaybe s $
-    nameExpansion s `mplus` takeName noPrefix `mplus` getSpecial noPrefix `mplus` getSpecial s
-  where
-    noPrefix = dropPrefix s
-    dropPrefix (c:rest) | c `elem` "!#" = rest
-    dropPrefix cs = cs
-    takeName s = do
-        let name = takeWhile isVariableChar s
-        guard . not $ null name
-        return name
-    getSpecial (c:_) | isSpecialVariableChar c = return [c]
-    getSpecial _ = fail "empty or not special"
-
-    nameExpansion ('!':next:rest) = do -- e.g. ${!foo*bar*}
-        guard $ isVariableChar next -- e.g. ${!@}
-        first <- find (not . isVariableChar) rest
-        guard $ first `elem` "*?@"
-        return ""
-    nameExpansion _ = Nothing
-
-prop_getBracedModifier1 = getBracedModifier "foo:bar:baz" == ":bar:baz"
-prop_getBracedModifier2 = getBracedModifier "!var:-foo" == ":-foo"
-prop_getBracedModifier3 = getBracedModifier "foo[bar]" == "[bar]"
-prop_getBracedModifier4 = getBracedModifier "foo[@]@Q" == "[@]@Q"
-prop_getBracedModifier5 = getBracedModifier "@@Q" == "@Q"
-getBracedModifier s = headOrDefault "" $ do
-    let var = getBracedReference s
-    a <- dropModifier s
-    dropPrefix var a
-  where
-    dropPrefix [] t        = return t
-    dropPrefix (a:b) (c:d) | a == c = dropPrefix b d
-    dropPrefix _ _         = []
-
-    dropModifier (c:rest) | c `elem` "#!" = [rest, c:rest]
-    dropModifier x        = [x]
-
--- Useful generic functions.
-
--- Get element 0 or a default. Like `head` but safe.
-headOrDefault _ (a:_) = a
-headOrDefault def _   = def
-
--- Get the last element or a default. Like `last` but safe.
-lastOrDefault def [] = def
-lastOrDefault _ list = last list
-
---- Get element n of a list, or Nothing. Like `!!` but safe.
-(!!!) list i =
-    case drop i list of
-        []    -> Nothing
-        (r:_) -> Just r
 
 -- Run a command if the shell is in the given list
 whenShell l c = do
@@ -992,26 +908,6 @@ supportsArrays Bash = True
 supportsArrays Ksh = True
 supportsArrays _ = False
 
--- Returns true if the shell is Bash or Ksh (sorry for the name, Ksh)
-isBashLike :: Parameters -> Bool
-isBashLike params =
-    case shellType params of
-        Bash -> True
-        Ksh -> True
-        Dash -> False
-        Sh -> False
-
--- Returns whether a token is a parameter expansion without any modifiers.
--- True for $var ${var} $1 $#
--- False for ${#var} ${var[x]} ${var:-0}
-isUnmodifiedParameterExpansion t =
-    case t of
-        T_DollarBraced _ False _ -> True
-        T_DollarBraced _ _ list ->
-            let str = concat $ oversimplify list
-            in getBracedReference str == str
-        _ -> False
-
 isTrueAssignmentSource c =
     case c of
         DataString SourceChecked -> False
@@ -1029,6 +925,14 @@ modifiesVariable params token name =
             Assignment (_, _, n, source) -> isTrueAssignmentSource source && n == name
             _ -> False
 
+isTestCommand t =
+    case t of
+        T_Condition {} -> True
+        T_SimpleCommand {} -> t `isCommand` "test"
+        T_Redirecting _ _ t -> isTestCommand t
+        T_Annotation _ _ t -> isTestCommand t
+        T_Pipeline _ _ [t] -> isTestCommand t
+        _ -> False
 
 return []
 runTests =  $( [| $(forAllProperties) (quickCheckWithResult (stdArgs { maxSuccess = 1 }) ) |])

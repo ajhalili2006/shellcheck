@@ -24,8 +24,8 @@ import ShellCheck.Formatter.Format
 
 import Data.Char
 import Data.List
-import GHC.Exts
 import System.IO
+import qualified Data.List.NonEmpty as NE
 
 format :: IO Formatter
 format = return Formatter {
@@ -45,12 +45,12 @@ outputResults cr sys =
     else mapM_ outputGroup fileGroups
   where
     comments = crComments cr
-    fileGroups = groupWith sourceFile comments
+    fileGroups = NE.groupWith sourceFile comments
     outputGroup group = do
-        let filename = sourceFile (head group)
+        let filename = sourceFile (NE.head group)
         result <- siReadFile sys (Just True) filename
         let contents = either (const "") id result
-        outputFile filename contents group
+        outputFile filename contents (NE.toList group)
 
 outputFile filename contents warnings = do
     let comments = makeNonVirtual warnings contents
@@ -88,7 +88,7 @@ outputError file error = putStrLn $ concat [
 attr s v = concat [ s, "='", escape v, "' " ]
 escape = concatMap escape'
 escape' c = if isOk c then [c] else "&#" ++ show (ord c) ++ ";"
-isOk x = any ($x) [isAsciiUpper, isAsciiLower, isDigit, (`elem` " ./")]
+isOk x = any ($ x) [isAsciiUpper, isAsciiLower, isDigit, (`elem` " ./")]
 
 severity "error" = "error"
 severity "warning" = "warning"

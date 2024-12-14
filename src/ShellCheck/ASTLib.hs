@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2019 Vidar Holen
+    Copyright 2012-2021 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -21,6 +21,7 @@
 module ShellCheck.ASTLib where
 
 import ShellCheck.AST
+import ShellCheck.Prelude
 import ShellCheck.Regex
 
 import Control.Monad.Writer
@@ -30,6 +31,7 @@ import Data.Functor
 import Data.Functor.Identity
 import Data.List
 import Data.Maybe
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 import Numeric (showHex)
 
@@ -138,7 +140,7 @@ getFlagsUntil stopCondition (T_SimpleCommand _ _ (_:args)) =
     flag (x, '-':'-':arg) = [ (x, takeWhile (/= '=') arg) ]
     flag (x, '-':args) = map (\v -> (x, [v])) args
     flag (x, _) = [ (x, "") ]
-getFlagsUntil _ _ = error "Internal shellcheck error, please report! (getFlags on non-command)"
+getFlagsUntil _ _ = error $ pleaseReport "getFlags on non-command"
 
 -- Get all flags in a GNU way, up until --
 getAllFlags :: Token -> [(Token, String)]
@@ -156,9 +158,10 @@ isFlag token =
         _ -> False
 
 -- Is this token a flag where the - is unquoted?
-isUnquotedFlag token = fromMaybe False $ do
-    str <- getLeadingUnquotedString token
-    return $ "-" `isPrefixOf` str
+isUnquotedFlag token =
+    case getLeadingUnquotedString token of
+        Just ('-':_) -> True
+        _ -> False
 
 -- getGnuOpts "erd:u:" will parse a list of arguments tokens like `read`
 --     -re -d : -u 3 bar
@@ -369,6 +372,21 @@ getGlobOrLiteralString = getLiteralStringExt f
     f (T_Glob _ str) = return str
     f _ = Nothing
 
+
+prop_getLiteralString1 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\x01") == Just "\1"
+prop_getLiteralString2 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\xyz") == Just "\\xyz"
+prop_getLiteralString3 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\x1") == Just "\x1"
+prop_getLiteralString4 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\x1y") == Just "\x1y"
+prop_getLiteralString5 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\xy") == Just "\\xy"
+prop_getLiteralString6 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\x") == Just "\\x"
+prop_getLiteralString7 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\1x") == Just "\1x"
+prop_getLiteralString8 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\12x") == Just "\o12x"
+prop_getLiteralString9 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\123x") == Just "\o123x"
+prop_getLiteralString10 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\1234") == Just "\o123\&4"
+prop_getLiteralString11 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\1") == Just "\1"
+prop_getLiteralString12 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\12") == Just "\o12"
+prop_getLiteralString13 = getLiteralString (T_DollarSingleQuoted (Id 0) "\\123") == Just "\o123"
+
 -- Maybe get the literal value of a token, using a custom function
 -- to map unrecognized Tokens into strings.
 getLiteralStringExt :: Monad m => (Token -> m String) -> Token -> m String
@@ -401,14 +419,15 @@ getLiteralStringExt more = g
             '\\' -> '\\' : rest
             'x' ->
                 case cs of
-                    (x:y:more) ->
-                        if isHexDigit x && isHexDigit y
-                        then chr (16*(digitToInt x) + (digitToInt y)) : rest
-                        else '\\':c:rest
+                    (x:y:more) | isHexDigit x && isHexDigit y ->
+                        chr (16*(digitToInt x) + (digitToInt y)) : decodeEscapes more
+                    (x:more) | isHexDigit x ->
+                        chr (digitToInt x) : decodeEscapes more
+                    more -> '\\' : 'x' : decodeEscapes more
             _ | isOctDigit c ->
-                let digits = take 3 $ takeWhile isOctDigit (c:cs)
-                    num = parseOct digits
-                in (if num < 256 then chr num else '?') : rest
+                let (digits, more) = spanMax isOctDigit 3 (c:cs)
+                    num = (parseOct digits) `mod` 256
+                in (chr num) : decodeEscapes more
             _ -> '\\' : c : rest
       where
         rest = decodeEscapes cs
@@ -416,6 +435,11 @@ getLiteralStringExt more = g
           where
             f n "" = n
             f n (c:rest) = f (n * 8 + digitToInt c) rest
+        spanMax f n list =
+            let (first, second) = span f list
+                (prefix, suffix) = splitAt n first
+            in
+                (prefix, suffix ++ second)
     decodeEscapes (c:cs) = c : decodeEscapes cs
     decodeEscapes [] = []
 
@@ -736,8 +760,8 @@ prop_executableFromShebang6 = executableFromShebang "/usr/bin/env --split-string
 prop_executableFromShebang7 = executableFromShebang "/usr/bin/env --split-string bash -x" == "bash"
 prop_executableFromShebang8 = executableFromShebang "/usr/bin/env --split-string foo=bar bash -x" == "bash"
 prop_executableFromShebang9 = executableFromShebang "/usr/bin/env foo=bar dash" == "dash"
-prop_executableFromShebang10 = executableFromShebang "/bin/busybox sh" == "ash"
-prop_executableFromShebang11 = executableFromShebang "/bin/busybox ash" == "ash"
+prop_executableFromShebang10 = executableFromShebang "/bin/busybox sh" == "busybox sh"
+prop_executableFromShebang11 = executableFromShebang "/bin/busybox ash" == "busybox ash"
 
 -- Get the shell executable from a string like '/usr/bin/env bash'
 executableFromShebang :: String -> String
@@ -754,7 +778,8 @@ executableFromShebang = shellFor
             [x] -> basename x
             (first:second:args) | basename first == "busybox" ->
                 case basename second of
-                   "sh" -> "ash" -- busybox sh is ash
+                   "sh" -> "busybox sh"
+                   "ash" -> "busybox ash"
                    x -> x
             (first:args) | basename first == "env" ->
                 fromEnvArgs args
@@ -763,6 +788,133 @@ executableFromShebang = shellFor
     fromEnvArgs args = fromMaybe "" $ find (notElem '=') $ skipFlags args
     basename s = reverse . takeWhile (/= '/') . reverse $ s
     skipFlags = dropWhile ("-" `isPrefixOf`)
+
+
+-- Determining if a name is a variable
+isVariableStartChar x = x == '_' || isAsciiLower x || isAsciiUpper x
+isVariableChar x = isVariableStartChar x || isDigit x
+isSpecialVariableChar = (`elem` "*@#?-$!")
+variableNameRegex = mkRegex "[_a-zA-Z][_a-zA-Z0-9]*"
+
+prop_isVariableName1 = isVariableName "_fo123"
+prop_isVariableName2 = not $ isVariableName "4"
+prop_isVariableName3 = not $ isVariableName "test: "
+isVariableName (x:r) = isVariableStartChar x && all isVariableChar r
+isVariableName _     = False
+
+
+-- Get the variable name from an expansion like ${var:-foo}
+prop_getBracedReference1 = getBracedReference "foo" == "foo"
+prop_getBracedReference2 = getBracedReference "#foo" == "foo"
+prop_getBracedReference3 = getBracedReference "#" == "#"
+prop_getBracedReference4 = getBracedReference "##" == "#"
+prop_getBracedReference5 = getBracedReference "#!" == "!"
+prop_getBracedReference6 = getBracedReference "!#" == "#"
+prop_getBracedReference7 = getBracedReference "!foo#?" == "foo"
+prop_getBracedReference8 = getBracedReference "foo-bar" == "foo"
+prop_getBracedReference9 = getBracedReference "foo:-bar" == "foo"
+prop_getBracedReference10 = getBracedReference "foo: -1" == "foo"
+prop_getBracedReference11 = getBracedReference "!os*" == ""
+prop_getBracedReference11b = getBracedReference "!os@" == ""
+prop_getBracedReference12 = getBracedReference "!os?bar**" == ""
+prop_getBracedReference13 = getBracedReference "foo[bar]" == "foo"
+getBracedReference s = fromMaybe s $
+    nameExpansion s `mplus` takeName noPrefix `mplus` getSpecial noPrefix `mplus` getSpecial s
+  where
+    noPrefix = dropPrefix s
+    dropPrefix (c:rest) | c `elem` "!#" = rest
+    dropPrefix cs = cs
+    takeName s = do
+        let name = takeWhile isVariableChar s
+        guard . not $ null name
+        return name
+    getSpecial (c:_) | isSpecialVariableChar c = return [c]
+    getSpecial _ = fail "empty or not special"
+
+    nameExpansion ('!':next:rest) = do -- e.g. ${!foo*bar*}
+        guard $ isVariableChar next -- e.g. ${!@}
+        first <- find (not . isVariableChar) rest
+        guard $ first `elem` "*?@"
+        return ""
+    nameExpansion _ = Nothing
+
+-- Get the variable modifier like /a/b in ${var/a/b}
+prop_getBracedModifier1 = getBracedModifier "foo:bar:baz" == ":bar:baz"
+prop_getBracedModifier2 = getBracedModifier "!var:-foo" == ":-foo"
+prop_getBracedModifier3 = getBracedModifier "foo[bar]" == "[bar]"
+prop_getBracedModifier4 = getBracedModifier "foo[@]@Q" == "[@]@Q"
+prop_getBracedModifier5 = getBracedModifier "@@Q" == "@Q"
+getBracedModifier s = headOrDefault "" $ do
+    let var = getBracedReference s
+    a <- dropModifier s
+    dropPrefix var a
+  where
+    dropPrefix [] t        = return t
+    dropPrefix (a:b) (c:d) | a == c = dropPrefix b d
+    dropPrefix _ _         = []
+
+    dropModifier (c:rest) | c `elem` "#!" = [rest, c:rest]
+    dropModifier x        = [x]
+
+-- Get the variables from indices like ["x", "y"] in ${var[x+y+1]}
+prop_getIndexReferences1 = getIndexReferences "var[x+y+1]" == ["x", "y"]
+getIndexReferences s = fromMaybe [] $ do
+    index:_ <- matchRegex re s
+    return $ matchAllStrings variableNameRegex index
+  where
+    re = mkRegex "(\\[.*\\])"
+
+prop_getOffsetReferences1 = getOffsetReferences ":bar" == ["bar"]
+prop_getOffsetReferences2 = getOffsetReferences ":bar:baz" == ["bar", "baz"]
+prop_getOffsetReferences3 = getOffsetReferences "[foo]:bar" == ["bar"]
+prop_getOffsetReferences4 = getOffsetReferences "[foo]:bar:baz" == ["bar", "baz"]
+getOffsetReferences mods = fromMaybe [] $ do
+-- if mods start with [, then drop until ]
+    _:offsets:_ <- matchRegex re mods
+    return $ matchAllStrings variableNameRegex offsets
+  where
+    re = mkRegex "^(\\[.+\\])? *:([^-=?+].*)"
+
+
+-- Returns whether a token is a parameter expansion without any modifiers.
+-- True for $var ${var} $1 $#
+-- False for ${#var} ${var[x]} ${var:-0}
+isUnmodifiedParameterExpansion t =
+    case t of
+        T_DollarBraced _ False _ -> True
+        T_DollarBraced _ _ list ->
+            let str = concat $ oversimplify list
+            in getBracedReference str == str
+        _ -> False
+
+-- Return the referenced variable if (and only if) it's an unmodified parameter expansion.
+getUnmodifiedParameterExpansion t =
+    case t of
+        T_DollarBraced _ _ list -> do
+            let str = concat $ oversimplify list
+            guard $ getBracedReference str == str
+            return str
+        _ -> Nothing
+
+--- A list of the element and all its parents up to the root node.
+getPath tree = NE.unfoldr $ \t -> (t, Map.lookup (getId t) tree)
+
+isClosingFileOp op =
+    case op of
+        T_IoDuplicate _ (T_GREATAND _) "-" -> True
+        T_IoDuplicate _ (T_LESSAND  _) "-" -> True
+        _                                  -> False
+
+getEnableDirectives root =
+    case root of
+        T_Annotation _ list _ -> [s | EnableComment s <- list]
+        _ -> []
+
+getExtendedAnalysisDirective :: Token -> Maybe Bool
+getExtendedAnalysisDirective root =
+    case root of
+        T_Annotation _ list _ -> listToMaybe $ [s | ExtendedAnalysis s <- list]
+        _ -> Nothing
 
 return []
 runTests = $quickCheckAll
