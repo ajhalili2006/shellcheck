@@ -84,6 +84,7 @@ jobs:
 
       - name: Build source
         run: |
+          find .
           mkdir -p bin
           mkdir -p bin/${{matrix.build}}
           ( cd bin && ../builders/run_builder ../source/source.tar.gz ../builders/${{matrix.build}} )
